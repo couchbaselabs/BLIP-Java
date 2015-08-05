@@ -8,7 +8,9 @@ package com.couchbase.blip;
  */
 public interface ConnectionDelegate
 {
+	void onOpen(Connection connection);
 	void onClose(Connection connection);
 	void onRequest(Connection connection, Message request);
 	void onResponse(Connection connection, Message response);
+	void onError(Connection connection, Message error);
 }

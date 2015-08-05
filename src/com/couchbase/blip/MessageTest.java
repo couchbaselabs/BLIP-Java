@@ -6,46 +6,64 @@ import org.junit.Test;
 
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.Map;
 
 import javax.xml.bind.DatatypeConverter;
 
 public class MessageTest
 {
-	@Test
-	public void testDecode()
+	private static void printByteBuffer(ByteBuffer buffer)
 	{
-		Message m = new Message();
-		m.decode(new byte[] {18, 'K', 'e', 'y', 0x00, 'V', 'a', 'l', 'u', 'e', 0x00, 0x01, 0x00, 'H', 'e', 'l', 'l', 'o', 0x00, '!'});
-		assertEquals(m.getProperty("Key"), "Value");
-		assertNotEquals(m.getProperty("Key"), "Another value");
-		assertNull(m.getProperty("Another key"));
-		assertEquals(m.getProperty("Profile"), "Hello");
-		assertEquals(m.body.length, 1);
-		assertEquals(m.body[0], (byte)'!');
+		if (buffer == null)
+		{
+			System.out.println("null");
+		}
+		else
+		{
+			byte[] data = new byte[buffer.limit()];
+			buffer.rewind();
+			buffer.get(data);
+			//System.out.println(DatatypeConverter.printHexBinary(data));
+			for (byte b : data)
+			{
+				if (b >= 0x20 && b < 0x7F) System.out.print((char)b);
+				else  System.out.print("[" + Integer.toHexString((int)(b & 0xFF)) + ']');
+			}
+			System.out.print(" (" + buffer.limit() + " bytes)");
+			System.out.println();
+		}
 	}
 	
+	/*
 	@Test
-	public void testEncode()
+	public void testEncodeAndDecode()
 	{
-		Message m = new Message();
-		m.isMine = true;
-		m.isMutable = true;
-		m.setProperty("Key", "Value");
-		m.setProperty("Profile", "test profile");
-		m.body = new byte[] {(byte)0xca, (byte)0xfe, (byte)0xba, (byte)0xbe};
-		byte[] encoding = m.encode();
-		Message m2 = new Message();
-		m2.decode(encoding);
-		assertEquals(m2.getProperty("Key"), "Value");
-		assertNull(m2.getProperty("Another key"));
-		assertEquals(m2.getProperty("Profile"), "test profile");
-		assertTrue(Arrays.equals(m2.body, new byte[] {(byte)0xca, (byte)0xfe, (byte)0xba, (byte)0xbe}));
-	}
-	
-	@Test
-	public void testCompression()
-	{
-		Message m = new Message();
+		Message m1 = new Message();
+		m1.isMutable = true;
+		m1.isMine = true;
+		m1.number = 297;
+		m1.body = ByteBuffer.allocate(48).put(8, (byte)'%');
+		m1.setProfile("Test profile");
+		m1.setProperty("Test key", "Test value");
+		m1.setProperty("Content-Type", "application/json");
+		ByteBuffer b1 = m1.makeNextFrame(16);
+		ByteBuffer b2 = m1.makeNextFrame(16);
+		ByteBuffer b3 = m1.makeNextFrame(256);
+		//printByteBuffer(b1);
+		//printByteBuffer(b2);
+		//printByteBuffer(b3);
 		
+		Message m2 = new Message();
+		m2.isMine = true;
+		m2.readFirstFrame(b1);
+		m2.readNextFrame(b2);
+		m2.readNextFrame(b3);
+		assertEquals(m2.getNumber(), 297);
+		assertEquals(m2.getProfile(), "Test profile");
+		assertEquals(m2.getProperty("Test key"), "Test value");
+		assertEquals(m2.getProperty("Content-Type"), "application/json");
+		assertEquals((char)m2.getBody().get(8), '%');
+		assertEquals(m1, m2);
 	}
+	*/
 }

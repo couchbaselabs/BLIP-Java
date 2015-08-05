@@ -1,18 +1,32 @@
 package com.couchbase.blip;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
+import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.nio.CharBuffer;
+import java.nio.charset.CharacterCodingException;
 import java.nio.charset.Charset;
+import java.nio.charset.CharsetDecoder;
 import java.nio.charset.CharsetEncoder;
+import java.nio.charset.CoderResult;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
+
+// TODO Error handling
+//		Fatal errors:
+// 		- Bad varint encoding
+// 		- Missing header value (either no flags, or just an empty frame)
+//		- Receiving a non-binary WebSocket message
+//		Frame errors:
+//		- Unknown message type
+//		- Message number refers to already-completed message
+//		- A property string contains invalid UTF-8
+//		- Property data's length field exceeds remaining frame data
+//		- Property data, if non-empty, does not end with a NUL byte
+//		- Body of a compressed frame fails to decompress
 
 /**
  * The Message class represents messages sent and received by applications running the BLIP protocol.
@@ -27,12 +41,9 @@ import java.util.zip.GZIPOutputStream;
  * @author Jed Foss-Alfke
  * @see <a href="https://github.com/couchbaselabs/BLIP-Cocoa/blob/master/Docs/BLIP%20Protocol%20v1.md">The BLIP Protocol</a>, {@link Connection}
  */
-public final class Message
-{
+public final class Message implements Comparable<Message>
+{	
 	// Constant values used in message encoding/decoding and transport:
-	
-	// The magic number at the start of a frame header
-	public static final int FRAME_MAGIC          = 0x9B34F206;
 	
 	// Message types
 	public static final int MSG                  = 0x00;
@@ -93,299 +104,322 @@ public final class Message
 	}
 	
 	
-	// Encoder for converting Java strings to C strings
-	private static final CharsetEncoder cStringEncoder = Charset.forName("ISO-8859-1").newEncoder();
+	// For converting Java strings to and from C strings
+	private static final Charset        cStringCharset = Charset.forName("ISO-8859-1");
+	private static final CharsetEncoder cStringEncoder = cStringCharset.newEncoder();
+	private static final CharsetDecoder cStringDecoder = cStringCharset.newDecoder();
 	
 	
-	protected Connection                connection;
+	static String debugPrintFrame(ByteBuffer frame)
+	{
+		int pos = frame.position();
+		int lim = frame.limit();
+		StringBuilder sb1 = new StringBuilder("{");
+		StringBuilder sb2 = new StringBuilder();
+		for (int i = pos;;)
+		{
+			byte b = frame.get(i);
+			sb1.append(Integer.toHexString(b & 0xFF));
+			sb2.append((b > 0x1F) ? (char)b : 'á');
+			if (++i < lim) sb1.append(", ");
+			else break;
+		}
+		sb1.append("} : \"");
+		sb1.append(sb2);
+		sb1.append('"');
+		return sb1.toString();
+	}
 	
-	protected int                       number;
+	
+	transient Connection      connection;
+	
+	int                       number;
+	int                       flags;
 
-	protected final Map<String, String> properties = new HashMap<String, String>();
-	protected byte[]                    body;
-	protected int                       flags;
+	final Map<String, String> properties = new HashMap<String, String>();
+	ByteBuffer                body;
 	
-	protected boolean                   isMine;
-	protected boolean					isMutable;
-	protected boolean                   isCompressed;
-	protected boolean                   isUrgent;
+	transient MessageDelegate delegate;
+	
+	boolean                   isMine;
+	boolean	                  isMutable;
+	boolean                   isCompressed;
+	boolean                   isUrgent;
 	
 	
 	Message() {}
 	
 	
-	// Somewhat hack-ish solution to decoder methods not being able to return both a value and a length
-	private transient int decoderOffset;	
+	// Internal fields for encoding/decoding:
+	transient boolean                  stateFlag;
+	private transient ByteBuffer       codingBuffer;
+	private transient Object           gzip;
 	
 	
-	// Converts a variable-length integer (varint) to a 32-bit integer
-	private int readVarint(byte[] data)
+	
+	private String getTypeName()
+	{
+		switch (this.flags & TYPE_MASK)
+		{
+		case MSG: 	 return "Request";
+		case RPY: 	 return "Reply";
+		case ERR: 	 return "Error";
+		case ACKMSG: return "Request-Ack";
+		case ACKRPY: return "Reply-Ack";
+		default: 	 return "Message";
+		}
+	}
+	
+	
+	// Reads a varint out of a bytebuffer, starting at its current offset
+	static int readVarint(ByteBuffer frame)
 	{
 		int result = 0;
-		int offset = this.decoderOffset;
-		int i;
-		             result  =  (i = data[offset++]) & 127;
-		if (i > 127) result &= ((i = data[offset++]) & 127) << 7;
-		if (i > 127) result &= ((i = data[offset++]) & 127) << 14;
-		if (i > 127) result &= ((i = data[offset++]) & 127) << 21;
-		if (i > 127) result &= ((i = data[offset++]) & 127) << 28;
-		if (i > 127) throw new RuntimeException("Varint is too large");
-		this.decoderOffset = offset;
+		int i; 
+		result  =  (i = frame.get()) & 127;
+		if ((i & 127) != i) result |= ((i = frame.get()) & 127) << 7;
+		if ((i & 127) != i) result |= ((i = frame.get()) & 127) << 14;
+		if ((i & 127) != i) result |= ((i = frame.get()) & 127) << 21;
+		if ((i & 127) != i) result |= ((i = frame.get()) & 127) << 28;
+		if ((i & 127) != i) throw new NumberFormatException("Invalid varint");
 		return result;
 	}
 	
-	// Converts a 32-bit integer to a variable-length integer (varint)
-	private static byte[] makeVarint(int value)
+	// Writes a varint into a bytebuffer, starting at its current offset
+	// We don't have to do range checks or reallocation here like we do with C string writing since varints are only in the first 12 bytes of the frame at most
+	static void writeVarint(ByteBuffer frame, int varint)
 	{
-		byte[] result;
-		if ((value & 0x7f) == value)
-		{
-			result = new byte[]{ (byte)(value) };
-		}
-		else if ((value & 0x3fff) == value)
-		{
-			result = new byte[]{ (byte)(value & 0x80), (byte)(value >> 7) };
-		}
-		else if ((value & 0x1ffff) == value)
-		{
-			result = new byte[]{ (byte)(value & 0x80), (byte)((value >> 7) & 0x80), (byte)(value >> 14) };
-		}
-		else if ((value & 0xffffff) == value)
-		{
-			result = new byte[]{ (byte)(value & 0x80), (byte)((value >> 7) & 0x80), (byte)((value >> 14) & 0x80), (byte)(value >> 21) };
-		}
-		else if ((value & 0x7fffffff) == value)
-		{
-			result = new byte[]{ (byte)(value & 0x80), (byte)((value >> 7) & 0x80), (byte)((value >> 14) & 0x80), (byte)((value >> 21) & 0x80), (byte)(value >> 28) };
-		}
-		else
-		{
-			result = new byte[]{ (byte)(value & 0x80), (byte)((value >> 7) & 0x80), (byte)((value >> 14) & 0x80), (byte)((value >> 21) & 0x80), (byte)((value >> 28) & 0x80), (byte)1 };
-		}
-		return result;
+		do {
+			if  ((varint         & 127) == varint) break; frame.put((byte)(varint | 128));
+			if (((varint >>>= 7) & 127) == varint) break; frame.put((byte)(varint | 128));
+			if (((varint >>>= 7) & 127) == varint) break; frame.put((byte)(varint | 128));
+			if (((varint >>>= 7) & 127) == varint) break; frame.put((byte)(varint | 128));
+			if (((varint >>>= 7) & 127) == varint) break; frame.put((byte)(varint | 128));
+		} while (false);
+		frame.put((byte)varint);
 	}
 	
-	
-	// Converts a null-terminated UTF-8 string to a Java string
-	private String readCString(byte[] data)
+	// Reads a C string
+	private static String readCString(ByteBuffer frame) throws CharacterCodingException
 	{
-		int offset = this.decoderOffset, i = offset;
-		String result;
-		if (data[i] == 0)
+		ByteBuffer start = frame.duplicate();
+		
+		byte b = frame.get();
+		if ((b & 0x1f) == b)
 		{
-			result = "";
+			String s = null;
+			if (b < commonProperties.length && frame.get() == 0) s = commonProperties[b - 1];
+			return s;
 		}
-		else if (data[i] < 31 && data[i] < commonProperties.length && data[i + 1] == 0)
-		{
-			result = commonProperties[data[i++] - 1];
-		}
-		else
-		{
-			while (data[++i] != 0);
-			result = new String(data, offset, i - offset);
-		}
-		this.decoderOffset = i + 1;
-		return result;
+		
+		while (frame.get() != 0);
+		return cStringDecoder.decode((ByteBuffer)start.limit(frame.position()-1)).toString();
 	}
 	
-	// Converts a Java string to a null-terminated UTF-8 string
-	private static byte[] makeCString(String string)
+	// Writes a C string and expands the frame if necessary
+	private static ByteBuffer writeCString(ByteBuffer frame, String string)
 	{
 		Byte b = propertyAbbreviations.get(string);
-		if (b == null)
+		if (b != null)
 		{
-			int len = string.length();
-			byte[] val = new byte[len + 1];
-			ByteBuffer bbuf = ByteBuffer.wrap(val);
-			cStringEncoder.encode(CharBuffer.wrap(string), bbuf, true);
-			val[len] = 0;
-			return val;
+			if (frame.remaining() < 2) frame = ByteBuffer.allocate(frame.capacity() << 1).put((ByteBuffer)frame.rewind());
+			frame.put(b);
+			frame.put((byte)0);
 		}
 		else
 		{
-			return new byte[]{b, 0x00};
+			CharBuffer chars = CharBuffer.wrap(string);
+			for (int size = frame.capacity();; cStringEncoder.flush(frame))
+			{
+				cStringEncoder.reset();
+				if (cStringEncoder.encode(chars, frame, true) == CoderResult.OVERFLOW)
+				{
+					//System.out.println("overflow, reallocating to size " + (size << 1) + " (printing \"" + string + "\")");
+					frame = ByteBuffer.allocate(size = (size << 1)).put((ByteBuffer)frame.rewind());
+				}
+				else break;
+			}
+			cStringEncoder.flush(frame);
+			frame.put((byte)0);
 		}
-	}
-	
-	// Compresses a message's body
-	private static byte[] compress(byte[] data) throws IOException
-	{
-		ByteArrayOutputStream os = new ByteArrayOutputStream();
-		GZIPOutputStream gzs = new GZIPOutputStream(os);
-		gzs.write(data);
-		gzs.close();
-		return os.toByteArray();
-	}
-	
-	// Decompresses a message's body
-	private static byte[] decompress(byte[] data) throws IOException
-	{
-		GZIPInputStream gzs = new GZIPInputStream(new ByteArrayInputStream(data));
-		ByteArrayOutputStream os = new ByteArrayOutputStream();
-		byte[] buf = new byte[1024];
-		int len;
-		while ((len = gzs.read(buf, 0, buf.length)) != -1)
-		{
-			os.write(buf, 0, len);
-		}
-		byte[] result = os.toByteArray();
-		gzs.close();
-		os.close();
-		return result;
+		return frame;
 	}
 	
 	
-	final void decode(byte[] data) 
+	// The first frame contains the message properties
+	final ByteBuffer makeFirstFrame()
 	{
-		this.decoderOffset = 0;
-		int propertiesEnd = readVarint(data) + this.decoderOffset;
-		if (data.length < propertiesEnd)  throw new RuntimeException("Properties block size out of bounds");
-		if (data[propertiesEnd - 1] != 0) throw new RuntimeException("Malformed properties block");
-		while (this.decoderOffset != propertiesEnd)
-		{
-			String key   = this.readCString(data);
-			if (this.decoderOffset == propertiesEnd) throw new RuntimeException("Malformed properties block");
-			String value = this.readCString(data);
-			this.properties.put(key, value);
-		}		
-		byte[] body = new byte[data.length - this.decoderOffset];
-		System.arraycopy(data, this.decoderOffset, body, 0, body.length);
-		this.body = body;
-	}
-	
-	// TODO Probably pretty inefficient, work more on this later
-	final byte[] encode()
-	{
-		if (!this.isMine) throw new UnsupportedOperationException("Cannot encode a message that is not mine");
-		
-		int propertiesSize = 0;
-		byte[][] propertyCStrings = new byte[this.properties.size() * 2][];
-		int iter = 0;
+		// Write the properties into a bytebuffer first:
+		ByteBuffer frame;
+		frame = ByteBuffer.allocate(0x20);
 		for (Map.Entry<String, String> entry : this.properties.entrySet())
 		{
-			byte[] key = makeCString(entry.getKey());
-			propertiesSize += key.length;
-			propertyCStrings[iter++] = key;
-			byte[] value = makeCString(entry.getValue());
-			propertiesSize += value.length;
-			propertyCStrings[iter++] = value;
+			frame = writeCString(frame, entry.getKey());
+			frame = writeCString(frame, entry.getValue());
 		}
-		byte[] sizeVarint = makeVarint(propertiesSize);
+		int len = frame.position();
+		frame.limit(len);
+		frame.rewind();
 		
-		//debug
-		//System.out.println("Varint conversion: (" + Integer.toHexString(propertiesSize) + ") to [" + DatatypeConverter.printHexBinary(sizeVarint) + "]");
-		
-		byte[] data = new byte[sizeVarint.length + propertiesSize + this.body.length];
-		System.arraycopy(sizeVarint, 0, data, 0, iter = sizeVarint.length);
-		for (byte[] b : propertyCStrings)
+		// Setup compression objects if this message should be compressed
+		if (this.isCompressed)
 		{
-			System.arraycopy(b, 0, data, iter, b.length);
-			iter += b.length;
+			//this.gzip = new GZIPOutputStream( );
+			
 		}
-		System.arraycopy(this.body, 0, data, iter, this.body.length);
 		
-		//debug
-		//System.out.println("Data output: [" + DatatypeConverter.printHexBinary(data) + "]");
-		
-		return data;
+		// Then make another bytebuffer and copy them into it after writing the header
+		// This is because the header is written as varints and the space it will occupy
+		// cannot be determined before writing the properties
+		// Since the properties are almost always small, this has little cost
+		ByteBuffer outFrame = ByteBuffer.allocate(len + 12);
+		writeVarint(outFrame, this.number);
+		writeVarint(outFrame, this.flags | MORECOMING);
+		writeVarint(outFrame, len);
+		outFrame.put(frame);
+		outFrame.limit(outFrame.position());
+		outFrame.rewind();
+		return outFrame;
 	}
 	
-	
-	// Testing method for SimpleWebSocketConnection
-	final void decodeFromSingleFrame(ByteBuffer frame)
-	{	
-		frame.rewind();	
-		
-		if (frame.getInt() != FRAME_MAGIC) throw new RuntimeException("Corrupted or invalid frame");
-		
-		this.number = frame.getInt();
-		frame.getShort();
-		int size = frame.getShort() - 12;
-		
-		byte[] data = new byte[size];
-		frame.get(data, 0, size);
-		
-		this.decode(data);
-	}
-	
-	// Testing method for SimpleWebSocketConnection
-	final ByteBuffer encodeAsSingleFrame()
+	// Creates the next frame in line, starting with the first frame containing message properties
+	// and then the remaining frames containing the message body split into pieces.
+	// This method is called repeatedly until the entire message has been encoded.
+	final ByteBuffer makeNextFrame(int maxLength)
 	{
-		byte[] encoding = this.encode();
-		ByteBuffer frame = ByteBuffer.allocate(encoding.length + 12);
-		frame.putInt(FRAME_MAGIC);
-		frame.putInt(this.number);
-		frame.putShort((short)this.flags);
-		frame.putShort((short)(encoding.length + 12));
-		frame.put(encoding);
+		if (this.stateFlag) return null;
+		
+		ByteBuffer frame = null;
+		ByteBuffer buf   = this.codingBuffer;	
+		if (buf == null)
+		{
+			this.codingBuffer = this.body.duplicate();
+			frame = this.makeFirstFrame();
+		}
+		else if (this.isCompressed)
+		{
+			GZIPOutputStream gzip = (GZIPOutputStream)this.gzip;
+			
+		}
+		else
+		{
+			int len   = buf.remaining();
+			int flags = this.flags;
+			if (len > maxLength)
+			{
+				len = maxLength;
+				flags |= MORECOMING;
+			}
+			else
+			{
+				this.stateFlag = true;
+			}
+			frame = ByteBuffer.allocate(len + 12);
+			writeVarint(frame, this.number);
+			writeVarint(frame, flags);
+			
+			ByteBuffer slice = buf.slice();
+			slice.limit(len);
+			frame.put(slice);
+			frame.limit(frame.position());
+			buf.position(buf.position() + len);
+			this.body.position(this.body.position() + len);
+		}
 		frame.rewind();
 		return frame;
 	}
 	
-	// The first frame contains the message header and properties
-	final ByteBuffer makeFirstFrame()
+	// Read the first frame, which in this implementation currently contains the properties block in its entirety and nothing afterward
+	// TODO support implementations which don't require this
+	final void readFirstFrame(ByteBuffer frame, int number, int flags)
 	{
-		
-		return null;
+		this.number        = number;
+		this.flags         = flags & ~MORECOMING;
+		this.isCompressed  = (flags & COMPRESSED) != 0;
+		this.isUrgent      = (flags & URGENT)     != 0;
+		int propertiesSize = frame.position() + readVarint(frame);
+		if (propertiesSize >= frame.limit() || frame.get(propertiesSize) != 0)
+		{
+			throw new RuntimeException("Malformed properties block");
+		}
+		try
+		{
+			while (true)
+			{
+				String key = readCString(frame);
+				if (frame.position() >= propertiesSize) throw new RuntimeException("Malformed properties block");
+				String value = readCString(frame);
+				this.properties.put(key, value);
+				if (frame.position() >= propertiesSize) break;
+			}
+		}
+		catch (CharacterCodingException e)
+		{
+			
+		}
+		if (this.isCompressed)
+		{
+			//this.gzip = new GZIPInputStream( );
+			
+		}
+		this.body = ByteBuffer.allocate(0x80);
 	}
 	
-	final ByteBuffer makeNextFrame(int maxLength)
+	// Read a frame containing a piece of the message body
+	final void readNextFrame(ByteBuffer frame, int flags)
 	{
-		
-		return null;
-	}
-	
-	final void readNextFrame(ByteBuffer frame)
-	{
-		
+		ByteBuffer buf = this.body;
+		if (this.isCompressed)
+		{
+			GZIPInputStream gzip = (GZIPInputStream)this.gzip;
+			
+		}
+		else
+		{
+			if (frame.remaining() > buf.remaining())
+			{
+				ByteBuffer newBuffer;
+				int neededSize = buf.position() + frame.remaining();
+				if ((flags & MORECOMING) == 0)
+				{
+					newBuffer = ByteBuffer.allocate(neededSize);
+				}
+				else
+				{
+					newBuffer = ByteBuffer.allocate(buf.capacity() << 1);
+				}
+				newBuffer.put((ByteBuffer)buf.rewind()).put(frame);
+				this.body = newBuffer;
+			}
+			else
+			{
+				buf.put(frame);
+				if ((flags & MORECOMING) == 0) buf.limit(buf.position()).rewind();
+			}
+		}
 	}
 	
 	
 	/**
-	 * Sends this message over its associated connection, if it's an outgoing request
-	 * @return the response this message receives, or null if it has the NOREPLY flag set
+	 * Sends the message over its associated connection.
+	 * @return the reply to this message, if this message is a request
 	 */
 	public final Message send()
 	{
 		return this.connection.sendRequest(this);
 	}
 	
-	/**
-	 * Sends a binary reply to this message, if it's an incoming request
-	 * @param body the body of the reply
-	 */
-	public final void reply(ByteBuffer body)
-	{
-		Message msg = new Message();
-		
-	}
 	
 	/**
-	 * Sends a string reply to this message, if it's an incoming request
-	 * @param body the body of the reply
-	 * @throws NullPointerException if the body string is null
+	 * Creates a new reply to this message
+	 * @return the reply
 	 */
-	public final void reply(String body)
+	public final Message newReply()
 	{
-		if (body == null) throw new NullPointerException("Body is null");
-		
-		Message msg = new Message();
-		msg.body = body.getBytes();
-		
-		
-	}
-	
-	/**
-	 * Sends a reply to this message containing the specified properties,
-	 * if it's an incoming request
-	 * @param properties a map of properties 
-	 */
-	public final void reply(Map<String, String> properties)
-	{
-		if (properties == null) throw new NullPointerException("Properties are null");
-		
-		Message msg = new Message();
-		msg.properties.putAll(properties);
+		Message reply    = new Message();
+		reply.number     = this.number;
+		reply.connection = this.connection;
+		return reply;
 	}
 	
 	
@@ -426,8 +460,77 @@ public final class Message
 	}
 	
 	/**
+	 * Returns true if this message is complete
+	 * @return true if this message is complete
+	 */
+	public final boolean isComplete()
+	{
+		return (this.flags & MORECOMING) == 0;
+	}
+	
+	/**
+	 * Returns true if this message is urgent
+	 * @return true if this message is urgent
+	 */
+	public final boolean isUrgent()
+	{
+		return this.isUrgent;
+	}
+	
+	/**
+	 * Sets the urgent status of this message.
+	 * Urgent messages are given higher priority during sending and receiving
+	 * @param urgent the urgent status
+	 */
+	public final void setUrgent(boolean isUrgent)
+	{
+		if (!this.isMutable) throw new IllegalStateException("Message is not mutable");
+		this.isUrgent = isUrgent;
+	}
+	
+	/**
+	 * Returns true if this request should not be replied to
+	 * @return true if this request should not be replied to
+	 */
+	public final boolean isNoReply()
+	{
+		return (this.flags & NOREPLY) != 0;
+	}
+	
+	/**
+	 * Sets the noreply status of this message
+	 * @param noreply the noreply status
+	 */
+	public final void setNoReply(boolean noreply)
+	{
+		if (!this.isMutable) throw new IllegalStateException("Message is not mutable");
+		if (noreply) this.flags |=  NOREPLY;
+		else         this.flags &= ~NOREPLY;
+	}
+	
+	/**
+	 * Returns true if this message's body is compressed during transit
+	 * @return true if this message's body is compressed
+	 */
+	public final boolean isCompressed()
+	{
+		return this.isCompressed;
+	}
+	
+	/**
+	 * Sets whether this message's body should be compressed during transit
+	 * @param compressed whether this message's body should be compressed
+	 */
+	public final void setCompressed(boolean compressed)
+	{
+		if (!this.isMutable) throw new IllegalStateException("Message is not mutable");
+		if (compressed) throw new UnsupportedOperationException("Compression not supported yet");
+		this.isCompressed = compressed;
+	}
+	
+	/**
 	 * Returns the BLIP connection that created or received this message
-	 * @return the Message's BLIP connection
+	 * @return the message's BLIP connection
 	 */
 	public final Connection getConnection()
 	{
@@ -435,12 +538,58 @@ public final class Message
 	}
 	
 	/**
+	 * Returns the delegate for this message
+	 * @return the delegate for this message
+	 */
+	public final MessageDelegate getDelegate()
+	{
+		return this.delegate;
+	}
+	
+	/**
+	 * Sets the delegate for this message
+	 * @param delegate the delegate
+	 */
+	public final void setDelegate(MessageDelegate delegate)
+	{
+		this.delegate = delegate;
+	}
+	
+	/**
+	 * Returns this message's number
+	 * @return this message's number
+	 */
+	public final int getNumber()
+	{
+		return this.number;
+	}
+	
+	/**
+	 * Returns this message's flags
+	 * @return this message's flags
+	 */
+	public final int getFlags()
+	{
+		return this.flags;
+	}
+	
+	/**
 	 * Returns the body of this message
 	 * @return the body of this message
 	 */
-	public final byte[] getBody()
+	public final ByteBuffer getBody()
 	{
 		return this.body;
+	}
+	
+	/**
+	 * Sets the body of this message
+	 * @param body the new body
+	 */
+	public final void setBody(ByteBuffer body)
+	{
+		if (!this.isMutable) throw new IllegalStateException("Message is not mutable");
+		this.body = body;
 	}
 	
 	/**
@@ -531,23 +680,113 @@ public final class Message
 		this.properties.put("Profile", profile);
 	}
 	
+	/**
+	 * Gets the value of the "Error-Domain" property
+	 * @return the error domain
+	 */
+	public final String getErrorDomain()
+	{
+		return this.properties.get("Error-Domain");
+	}
 	
 	/**
-	 * Returns a string representation of this message
-	 * @return the message's string representation
+	 * Sets the value of the "Error-Domain" property
+	 * @param domain the error domain
+	 */
+	public final void setErrorDomain(String domain)
+	{
+		this.properties.put("Error-Domain", domain);
+	}
+	
+	/**
+	 * Gets the value of the "Error-Code" property
+	 * @return the error code
+	 */
+	public final int getErrorCode()
+	{
+		String code = this.properties.get("Error-Code");
+		return Integer.parseInt(code);
+	}
+	
+	/**
+	 * Sets the value of the "Error-Code" property
+	 * @param code the error code
+	 */
+	public final void setErrorCode(int code)
+	{
+		String err = Integer.toString(code);
+		this.properties.put("Error-Code", err);
+	}
+	
+	/**
+	 * Converts an error message to a Java exception
+	 * @return a BLIPException representation of this error message
+	 */
+	public final BLIPException toException()
+	{
+		if ((this.flags & TYPE_MASK) != ERR) throw new RuntimeException("Message is not an error");
+		return new BLIPException(this);
+	}
+	
+	
+	/**
+	 * Returns a hash code for this message
+	 * @return this message's hash code
+	 */
+	@Override
+	public final int hashCode()
+	{
+		return this.number ^ this.connection.hashCode();
+	}
+	
+	/**
+	 * Compares this message with another object for equality
+	 * @param object the object to compare this message to
+	 * @return true if this message is equal to the specified object
+	 */
+	@Override
+	public final boolean equals(Object that)
+	{
+		return (that instanceof Message) && this.equals((Message)that);
+	}
+	
+	/**
+	 * Compares this message with another message for equality
+	 * @param message the message to compare this message to
+	 * @return true if this message is equal to the specified message
+	 */
+	public final boolean equals(Message that)
+	{
+		return (this.number == that.number) && (this.connection == that.connection);
+	}
+	
+	/**
+	 * Compares this message with another message for ordering
+	 * @param message the message to compare this message to
+	 * @return a negative integer, zero, or a positive integer if this message's place is less than, equal, or greater than the specified message
+	 */
+	@Override
+	public final int compareTo(Message message)
+	{
+		return this.number - message.number;
+	}	
+	
+	/**
+	 * Returns a string describing this message
+	 * @return this message's string representation
 	 */
 	@Override
 	public final String toString()
 	{
 		StringBuilder sb = new StringBuilder(String.format("%s[#%d%s, %d bytes",
-						   this.getClass().getSimpleName(),
+						   this.getTypeName(), //this.getClass().getSimpleName(),
 						   this.number,
 						   this.isMine ? "->" : "<-",
-						   this.body.length));
+						   this.body.limit()));
 		
 		if ((this.flags & COMPRESSED) != 0)
 		{
-			
+			sb.append(", gzipped");
 		}
 		if ((this.flags & URGENT) != 0)
 			sb.append(", urgent");
@@ -563,7 +802,7 @@ public final class Message
 	}
 	
 	/**
-	 * Returns a string representation of this message, containing a list of its property key-value pairs
+	 * Returns a string describing this message, containing a list of its property key-value pairs
 	 * @return the string representation
 	 */
 	public final String toStringWithProperties()
@@ -581,17 +820,5 @@ public final class Message
 		}
 		sb.append('}');
 		return sb.toString();
-	}
-	
-	@Override
-	public final int hashCode()
-	{
-		return super.hashCode();
-	}
-	
-	@Override
-	public final boolean equals(Object obj)
-	{
-		return super.equals(obj);
 	}
 }
