@@ -1,43 +1,50 @@
 package com.couchbase.blip;
 
+import java.io.Closeable;
+
 /**
  * An abstract class representing a network connection that can send and receive BLIP messages.
  * 
  * @author Jed Foss-Alfke
- * @see {@link Message}, {@link SimpleWebSocketConnection}
+ * @see {@link Message}, {@link WebSocketConnection}
  */
-public abstract class Connection
-{
-	protected transient ConnectionDelegate delegate;
-	protected transient int                currentNumber = 0;
+public abstract class Connection implements Closeable
+{	
+	// The serial number of the next message created
+	private transient int currentNumber = 0;
+	
+	
+	protected transient ConnectionListener listener;
+
 	
 	/**
 	 * Opens this connection to the network
 	 * @throws IllegalStateException if this connection has already been opened
 	 */
-	public abstract void connect();
+	public abstract void connect() throws IllegalStateException;
 	
 	/**
 	 * Closes this connection
 	 */
+	@Override
 	public abstract void close();
 	
 	/**
-	 * Returns the delegate for this connection
-	 * @return the delegate
+	 * Returns the listener for this connection
+	 * @return the listener
 	 */
-	public final ConnectionDelegate getDelegate()
+	public final ConnectionListener getListener()
 	{
-		return this.delegate;
+		return this.listener;
 	}
 	
 	/**
-	 * Sets the delegate for this connection
-	 * @param delegate the delegate
+	 * Sets the listener for this connection
+	 * @param listener the listener
 	 */
-	public final void setDelegate(ConnectionDelegate delegate)
+	public final void setListener(ConnectionListener listener)
 	{
-		this.delegate = delegate;
+		this.listener = listener;
 	}
 	
 	/**
@@ -46,13 +53,7 @@ public abstract class Connection
 	 */
 	public final Message newRequest()
 	{
-		Message msg    = new Message();
-		msg.isMine     = true;
-		msg.isMutable  = true;
-		msg.connection = this;
-		msg.number     = this.currentNumber++;
-		msg.flags      = Message.MSG;
-		return msg;
+		return new Message(this, this.currentNumber++, Message.MSG, true);
 	}
 	
 	/**
@@ -61,5 +62,5 @@ public abstract class Connection
 	 * @return the response to this request
 	 * @see {@link Message#send()}
 	 */
-	protected abstract Message sendRequest(Message request);
+	protected abstract Message sendMessage(Message request);
 }

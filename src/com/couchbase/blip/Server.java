@@ -11,12 +11,13 @@ import org.java_websocket.handshake.ClientHandshake;
 import org.java_websocket.server.WebSocketServer;
 
 /**
- * A listener which manages a group of BLIP web socket connections.
+ * A server which manages a group of BLIP web socket connections. A server listens on a specific port for incoming BLIP connections,
+ * and manages an internal collection of BLIP connections which are connected to it.
  * 
  * @author Jed Foss-Alfke
  * @see {@link WebSocketConnection}, {@link Message}
  */
-public final class WebSocketListener
+public final class Server
 {	
 	private WebSocketServer   socket;
 	private InetSocketAddress address;
@@ -24,7 +25,7 @@ public final class WebSocketListener
 	
 	final IdentityHashMap<WebSocket, WebSocketConnection> connections = new IdentityHashMap<WebSocket, WebSocketConnection>();
 	
-	ConnectionDelegate delegate;
+	ServerListener listener;
 	
 	
 	/**
@@ -32,7 +33,7 @@ public final class WebSocketListener
 	 * @param port
 	 * @throws UnknownHostException if the port is invalid
 	 */
-	public WebSocketListener(int port) throws UnknownHostException
+	public Server(int port) throws UnknownHostException
 	{
 		this(new InetSocketAddress(port));
 	}
@@ -42,7 +43,7 @@ public final class WebSocketListener
 	 * @param address
 	 * @throws NullPointerException if the address is null
 	 */
-	public WebSocketListener(InetSocketAddress address)
+	public Server(InetSocketAddress address)
 	{
 		if (address == null) throw new NullPointerException("Address is null");
 		this.address = address;
@@ -64,38 +65,35 @@ public final class WebSocketListener
 			public void onOpen(WebSocket socket, ClientHandshake handshake)
 			{				
 				WebSocketConnection connection = new WebSocketConnection(socket);
-				WebSocketListener.this.connections.put(socket, connection);
+				Server.this.connections.put(socket, connection);
 				
-				ConnectionDelegate del = WebSocketListener.this.delegate;
+				ServerListener del = Server.this.listener;
 				if (del != null)
-					del.onOpen(connection);
+					del.connectionOpened(Server.this, connection);
 			}
 			
 			@Override
 			public void onClose(WebSocket socket, int code, String reason, boolean remote)
 			{
-				WebSocketConnection connection = WebSocketListener.this.connections.remove(socket);				
-				ConnectionDelegate del;
+				WebSocketConnection connection = Server.this.connections.remove(socket);				
 				
-				del = WebSocketListener.this.delegate;
+				ServerListener del = Server.this.listener;
 				if (del != null)
-					del.onClose(connection);
-				
-				del = connection.delegate;
-				if (del != null) 
-					del.onClose(connection);
+					del.connectionClosed(Server.this, connection);
 				
 				connection.shutdown();
 			}
 
-			// Ignore text-based messages
 			@Override
-			public void onMessage(WebSocket socket, String message) {}
+			public void onMessage(WebSocket socket, String message)
+			{
+				// TODO This should be a fatal error
+			}
 			
 			@Override
 			public void onMessage(WebSocket socket, ByteBuffer message)
 			{
-				WebSocketConnection c = WebSocketListener.this.connections.get(socket);
+				WebSocketConnection c = Server.this.connections.get(socket);
 				if (c != null)
 				{
 					c.onFrame(message);
@@ -137,24 +135,24 @@ public final class WebSocketListener
 	 * Returns the delegate for this listener
 	 * @return the delegate
 	 */
-	public ConnectionDelegate getDelegate()
+	public ServerListener getListener()
 	{
-		return this.delegate;
+		return this.listener;
 	}
 	
 	/**
 	 * Sets the delegate for this listener
 	 * @param delegate the delegate
 	 */
-	public void setDelegate(ConnectionDelegate delegate)
+	public void setListener(ServerListener listener)
 	{
-		this.delegate = delegate;
+		this.listener = listener;
 	}
 	
 	
 	@Override
 	public String toString()
 	{
-		return "BLIP listener (" + this.address + ")";
+		return "BLIP server (" + this.address + ")";
 	}
 }

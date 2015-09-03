@@ -1,5 +1,9 @@
 package com.couchbase.blip;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.nio.CharBuffer;
@@ -15,20 +19,24 @@ import java.util.Map;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
-// TODO Error handling
-//		Fatal errors:
-// 		- Bad varint encoding
-// 		- Missing header value (either no flags, or just an empty frame)
-//		- Receiving a non-binary WebSocket message
-//		Frame errors:
-//		- Unknown message type
-//		- Message number refers to already-completed message
-//		- A property string contains invalid UTF-8
-//		- Property data's length field exceeds remaining frame data
-//		- Property data, if non-empty, does not end with a NUL byte
-//		- Body of a compressed frame fails to decompress
+// TODO Masterlist:
+//
+//      - Error handling
+//		  - Fatal errors:
+// 		    - Bad varint encoding
+// 		    - Missing header value (either no flags, or just an empty frame)
+//		    - Receiving a non-binary WebSocket message
+//		  - Frame errors:
+//		    - Unknown message type
+//		    - Message number refers to already-completed message
+//		    - A property string contains invalid UTF-8
+//		    - Property data's length field exceeds remaining frame data
+//		    - Property data, if non-empty, does not end with a NUL byte
+//          - Body of a compressed frame fails to decompress
+//      - Message compression
 
-/**
+	
+/** 
  * The Message class represents messages sent and received by applications running the BLIP protocol.
  * <br><br>
  * A message is comprised of two parts: the properties, which are a set of string key-value pairs,
@@ -39,29 +47,30 @@ import java.util.zip.GZIPOutputStream;
  * have to contain any data.
  * 
  * @author Jed Foss-Alfke
- * @see <a href="https://github.com/couchbaselabs/BLIP-Cocoa/blob/master/Docs/BLIP%20Protocol%20v1.md">The BLIP Protocol</a>, {@link Connection}
+ * @see <a href="https://github.com/couchbaselabs/BLIP-Cocoa/blob/master/Docs/BLIP%20Protocol%20v1.md">The BLIP Protocol</a>,
+ *      {@link Connection}
  */
 public final class Message implements Comparable<Message>
 {	
 	// Constant values used in message encoding/decoding and transport:
 	
 	// Message types
-	public static final int MSG                  = 0x00;
-	public static final int RPY                  = 0x01;
-	public static final int ERR                  = 0x02;
-	public static final int ACKMSG               = 0x04;
-	public static final int ACKRPY               = 0x05;
+	static final int MSG                  = 0x00;
+	static final int RPY                  = 0x01;
+	static final int ERR                  = 0x02;
+	static final int ACKMSG               = 0x04;
+	static final int ACKRPY               = 0x05;
 	
-	public static final int TYPE_MASK            = 0x07;
+	static final int TYPE_MASK            = 0x07;
 	
 	// Frame flags
-	public static final int COMPRESSED           = 0x08;
-	public static final int URGENT               = 0x10;
-	public static final int NOREPLY              = 0x20;
-	public static final int MORECOMING           = 0x40;
-	public static final int META                 = 0x80;
+	static final int COMPRESSED           = 0x08;
+	static final int URGENT               = 0x10;
+	static final int NOREPLY              = 0x20;
+	static final int MORECOMING           = 0x40;
+	static final int META                 = 0x80;
 	
-	public static final int MAX_FLAG             = 0xFF;
+	static final int MAX_FLAG             = 0xFF;
 	
 	// Error message codes ("Error-Code" property)
 	public static final int ERROR_BAD_REQUEST    = 400;
@@ -105,12 +114,13 @@ public final class Message implements Comparable<Message>
 	
 	
 	// For converting Java strings to and from C strings
-	private static final Charset        cStringCharset = Charset.forName("ISO-8859-1");
-	private static final CharsetEncoder cStringEncoder = cStringCharset.newEncoder();
-	private static final CharsetDecoder cStringDecoder = cStringCharset.newDecoder();
+	private static final Charset cStringCharset = Charset.forName("ISO-8859-1");
+	
+	// Default body so body is not null
+	private static final ByteBuffer emptyBody = ByteBuffer.allocate(0);
 	
 	
-	static String debugPrintFrame(ByteBuffer frame)
+	protected static String debugPrintFrame(ByteBuffer frame)
 	{
 		int pos = frame.position();
 		int lim = frame.limit();
@@ -132,14 +142,15 @@ public final class Message implements Comparable<Message>
 	
 	
 	transient Connection      connection;
+	transient Message         linkedMsg;
 	
 	int                       number;
 	int                       flags;
 
 	final Map<String, String> properties = new HashMap<String, String>();
-	ByteBuffer                body;
+	ByteBuffer                body       = emptyBody;
 	
-	transient MessageDelegate delegate;
+	transient ReplyListener   listener;
 	
 	boolean                   isMine;
 	boolean	                  isMutable;
@@ -147,13 +158,21 @@ public final class Message implements Comparable<Message>
 	boolean                   isUrgent;
 	
 	
-	Message() {}
+	// Internal use only
+	Message(Connection connection, int number, int flags, boolean outgoing)
+	{
+		this.connection = connection;
+		this.number     = number;
+		this.flags      = flags;
+		this.isMine     = outgoing;
+		this.isMutable  = outgoing;
+	}
 	
 	
 	// Internal fields for encoding/decoding:
 	transient boolean                  stateFlag;
 	private transient ByteBuffer       codingBuffer;
-	private transient Object           gzip;
+	private transient Object           gzipIn, gzipOut;
 	
 	
 	
@@ -162,10 +181,10 @@ public final class Message implements Comparable<Message>
 		switch (this.flags & TYPE_MASK)
 		{
 		case MSG: 	 return "Request";
-		case RPY: 	 return "Reply";
+		case RPY: 	 return "Response";
 		case ERR: 	 return "Error";
 		case ACKMSG: return "Request-Ack";
-		case ACKRPY: return "Reply-Ack";
+		case ACKRPY: return "Response-Ack";
 		default: 	 return "Message";
 		}
 	}
@@ -213,10 +232,12 @@ public final class Message implements Comparable<Message>
 		}
 		
 		while (frame.get() != 0);
-		return cStringDecoder.decode((ByteBuffer)start.limit(frame.position()-1)).toString();
+		return cStringCharset.newDecoder().decode((ByteBuffer)start.limit(frame.position()-1)).toString();
 	}
 	
 	// Writes a C string and expands the frame if necessary
+	// FIXME: Property strings containing nul ('\0') characters will corrupt the frame when they are written.
+	//        Figure out how to throw an exception here if any nul chars are encountered
 	private static ByteBuffer writeCString(ByteBuffer frame, String string)
 	{
 		Byte b = propertyAbbreviations.get(string);
@@ -228,13 +249,16 @@ public final class Message implements Comparable<Message>
 		}
 		else
 		{
+			CharsetEncoder cStringEncoder = cStringCharset.newEncoder();
+			
 			CharBuffer chars = CharBuffer.wrap(string);
 			for (int size = frame.capacity();; cStringEncoder.flush(frame))
 			{
 				cStringEncoder.reset();
 				if (cStringEncoder.encode(chars, frame, true) == CoderResult.OVERFLOW)
 				{
-					//System.out.println("overflow, reallocating to size " + (size << 1) + " (printing \"" + string + "\")");
+					// debug output
+					// System.out.println("overflow, reallocating to size " + (size << 1) + " (printing \"" + string + "\")");
 					frame = ByteBuffer.allocate(size = (size << 1)).put((ByteBuffer)frame.rewind());
 				}
 				else break;
@@ -246,7 +270,7 @@ public final class Message implements Comparable<Message>
 	}
 	
 	
-	// The first frame contains the message properties
+	// Creates the first frame, which contains the message properties
 	final ByteBuffer makeFirstFrame()
 	{
 		// Write the properties into a bytebuffer first:
@@ -264,8 +288,12 @@ public final class Message implements Comparable<Message>
 		// Setup compression objects if this message should be compressed
 		if (this.isCompressed)
 		{
-			//this.gzip = new GZIPOutputStream( );
-			
+			try
+			{
+				this.gzipIn  = new ByteBufferInputStream(this.body);
+				this.gzipOut = new GZIPOutputStream(new ByteArrayOutputStream());
+			}
+			catch (IOException e) {}
 		}
 		
 		// Then make another bytebuffer and copy them into it after writing the header
@@ -298,7 +326,7 @@ public final class Message implements Comparable<Message>
 		}
 		else if (this.isCompressed)
 		{
-			GZIPOutputStream gzip = (GZIPOutputStream)this.gzip;
+			GZIPOutputStream gzipOut = (GZIPOutputStream)this.gzipOut;
 			
 		}
 		else
@@ -331,10 +359,9 @@ public final class Message implements Comparable<Message>
 	
 	// Read the first frame, which in this implementation currently contains the properties block in its entirety and nothing afterward
 	// TODO support implementations which don't require this
-	final void readFirstFrame(ByteBuffer frame, int number, int flags)
+	final void readFirstFrame(ByteBuffer frame, int flags)
 	{
-		this.number        = number;
-		this.flags         = flags & ~MORECOMING;
+		this.flags         = flags;
 		this.isCompressed  = (flags & COMPRESSED) != 0;
 		this.isUrgent      = (flags & URGENT)     != 0;
 		int propertiesSize = frame.position() + readVarint(frame);
@@ -368,33 +395,36 @@ public final class Message implements Comparable<Message>
 	// Read a frame containing a piece of the message body
 	final void readNextFrame(ByteBuffer frame, int flags)
 	{
-		ByteBuffer buf = this.body;
+		this.flags = flags;
+		ByteBuffer body = this.body;
 		if (this.isCompressed)
 		{
-			GZIPInputStream gzip = (GZIPInputStream)this.gzip;
-			
+			GZIPInputStream gzip = (GZIPInputStream)this.gzipIn;
+			//gzip.
 		}
 		else
 		{
-			if (frame.remaining() > buf.remaining())
+			if (frame.remaining() > body.remaining())
 			{
 				ByteBuffer newBuffer;
-				int neededSize = buf.position() + frame.remaining();
+				int neededSize = body.position() + frame.remaining();
 				if ((flags & MORECOMING) == 0)
 				{
 					newBuffer = ByteBuffer.allocate(neededSize);
 				}
 				else
 				{
-					newBuffer = ByteBuffer.allocate(buf.capacity() << 1);
+					int capacity = body.capacity();
+					while (capacity < neededSize) capacity <<= 1;
+					newBuffer = ByteBuffer.allocate(capacity);
 				}
-				newBuffer.put((ByteBuffer)buf.rewind()).put(frame);
+				newBuffer.put((ByteBuffer)body.limit(body.position()).rewind()).put(frame);
 				this.body = newBuffer;
 			}
 			else
 			{
-				buf.put(frame);
-				if ((flags & MORECOMING) == 0) buf.limit(buf.position()).rewind();
+				body.put(frame);
+				if ((flags & MORECOMING) == 0) body.limit(body.position()).rewind();
 			}
 		}
 	}
@@ -402,11 +432,11 @@ public final class Message implements Comparable<Message>
 	
 	/**
 	 * Sends the message over its associated connection.
-	 * @return the reply to this message, if this message is a request
+	 * @return the response to this message, if this message is a request
 	 */
 	public final Message send()
-	{
-		return this.connection.sendRequest(this);
+	{		
+		return this.connection.sendMessage(this);
 	}
 	
 	
@@ -414,14 +444,25 @@ public final class Message implements Comparable<Message>
 	 * Creates a new reply to this message
 	 * @return the reply
 	 */
-	public final Message newReply()
+	public final Message newResponse()
 	{
-		Message reply    = new Message();
-		reply.number     = this.number;
-		reply.connection = this.connection;
-		return reply;
+		if (this.linkedMsg == null)
+		{
+			if (!this.isRequest() || this.isNoReply()) throw new UnsupportedOperationException("Message cannot be replied to");
+			this.linkedMsg = new Message(this.connection, this.number, RPY, true);
+		}
+		return this.linkedMsg;
 	}
 	
+	
+	/**
+	 * Returns the type of this message
+	 * @return the type of this message
+	 */
+	public final int getMessageType()
+	{
+		return this.flags & TYPE_MASK;
+	}
 	
 	/**
 	 * Returns true if this message is a request
@@ -439,6 +480,11 @@ public final class Message implements Comparable<Message>
 	public final boolean isReply()
 	{
 		return (this.flags & TYPE_MASK) == RPY;
+	}
+	
+	public final boolean isError()
+	{
+		return (this.flags & TYPE_MASK) == ERR;
 	}
 	
 	/**
@@ -538,39 +584,21 @@ public final class Message implements Comparable<Message>
 	}
 	
 	/**
-	 * Returns the delegate for this message
-	 * @return the delegate for this message
+	 * Returns the listener for this message
+	 * @return the listener for this message
 	 */
-	public final MessageDelegate getDelegate()
+	public final ReplyListener getListener()
 	{
-		return this.delegate;
+		return this.listener;
 	}
 	
 	/**
-	 * Sets the delegate for this message
-	 * @param delegate the delegate
+	 * Sets the listener for this message
+	 * @param listener the listener
 	 */
-	public final void setDelegate(MessageDelegate delegate)
+	public final void setListener(ReplyListener listener)
 	{
-		this.delegate = delegate;
-	}
-	
-	/**
-	 * Returns this message's number
-	 * @return this message's number
-	 */
-	public final int getNumber()
-	{
-		return this.number;
-	}
-	
-	/**
-	 * Returns this message's flags
-	 * @return this message's flags
-	 */
-	public final int getFlags()
-	{
-		return this.flags;
+		this.listener = listener;
 	}
 	
 	/**
@@ -589,6 +617,7 @@ public final class Message implements Comparable<Message>
 	public final void setBody(ByteBuffer body)
 	{
 		if (!this.isMutable) throw new IllegalStateException("Message is not mutable");
+		if (body == null) this.body = emptyBody;
 		this.body = body;
 	}
 	
@@ -625,6 +654,16 @@ public final class Message implements Comparable<Message>
 	}
 	
 	/**
+	 * Checks if the message contains the specified property
+	 * @param property the name of the property
+	 * @return true if the message contains the property
+	 */
+	public final boolean hasProperty(String property)
+	{
+		return this.properties.containsKey(property);
+	}
+	
+	/**
 	 * Removes the specified property
 	 * @param property the name of the property
 	 */
@@ -635,13 +674,22 @@ public final class Message implements Comparable<Message>
 	}
 	
 	/**
-	 * Checks if the message contains the specified property
-	 * @param property the name of the property
-	 * @return true if the message contains the property
+	 * Clears all properties
 	 */
-	public final boolean hasProperty(String property)
+	public final void clearProperties()
 	{
-		return this.properties.containsKey(property);
+		if (!this.isMutable) throw new RuntimeException("Message is not mutable");
+		this.properties.clear();
+	}
+	
+	/**
+	 * Copies all properties from another message
+	 * @param msg the message whose properties will be copied
+	 */
+	public final void copyProperties(Message msg)
+	{
+		if (!this.isMutable) throw new RuntimeException("Message is not mutable");
+		this.properties.putAll(msg.properties);
 	}
 	
 	/**
@@ -702,7 +750,7 @@ public final class Message implements Comparable<Message>
 	 * Gets the value of the "Error-Code" property
 	 * @return the error code
 	 */
-	public final int getErrorCode()
+	public final int getErrorCode() throws NumberFormatException
 	{
 		String code = this.properties.get("Error-Code");
 		return Integer.parseInt(code);
@@ -716,16 +764,6 @@ public final class Message implements Comparable<Message>
 	{
 		String err = Integer.toString(code);
 		this.properties.put("Error-Code", err);
-	}
-	
-	/**
-	 * Converts an error message to a Java exception
-	 * @return a BLIPException representation of this error message
-	 */
-	public final BLIPException toException()
-	{
-		if ((this.flags & TYPE_MASK) != ERR) throw new RuntimeException("Message is not an error");
-		return new BLIPException(this);
 	}
 	
 	
@@ -766,9 +804,12 @@ public final class Message implements Comparable<Message>
 	 * @return a negative integer, zero, or a positive integer if this message's place is less than, equal, or greater than the specified message
 	 */
 	@Override
-	public final int compareTo(Message message)
+	public final int compareTo(Message that)
 	{
-		return this.number - message.number;
+		if (this.connection == that.connection)
+			return this.number - that.number;
+		else
+			return 0; // FIXME
 	}	
 	
 	/**
@@ -820,5 +861,37 @@ public final class Message implements Comparable<Message>
 		}
 		sb.append('}');
 		return sb.toString();
+	}
+}
+
+final class ByteBufferInputStream extends InputStream
+{
+	private final ByteBuffer buffer;
+	
+	public ByteBufferInputStream(ByteBuffer buffer)
+	{
+		this.buffer = buffer;
+	}
+	
+	@Override
+	public int read() throws IOException
+	{
+		return (this.buffer.get() & 0xFF);
+	}
+}
+
+final class ByteBufferOutputStream extends OutputStream
+{
+	private final ByteBuffer buffer;
+	
+	public ByteBufferOutputStream(ByteBuffer buffer)
+	{
+		this.buffer = buffer;
+	}
+
+	@Override
+	public void write(int b) throws IOException
+	{
+		this.buffer.put((byte)(b & 0xFF));
 	}
 }

@@ -24,10 +24,13 @@ import org.java_websocket.handshake.ServerHandshake;
  * shut down manually once the program is finished using them.
  * 
  * @author Jed Foss-Alfke
- * @see {@link Connection}, {@link WebSocketListener}, {@link Message}
+ * @see {@link Connection}, {@link Server}, {@link Message}
  */
 public final class WebSocketConnection extends Connection
 {
+	private static final int MAX_FRAME_SIZE = 0x8000;
+	
+	
 	WebSocket              socket;
 	URI                    uri;
 	volatile AtomicBoolean isClosed = new AtomicBoolean(false);
@@ -90,7 +93,10 @@ public final class WebSocketConnection extends Connection
 			}
 
 			@Override
-			public void onMessage(String message) {}
+			public void onMessage(String message)
+			{
+				WebSocketConnection.this.fatal();
+			}
 			
 			@Override
 			public void onMessage(ByteBuffer message)
@@ -101,7 +107,7 @@ public final class WebSocketConnection extends Connection
 			@Override
 			public void onError(Exception error)
 			{
-				if (error != null) error.printStackTrace();
+				WebSocketConnection.this.fatal();
 			}
 		};
 		this.socket = socket;
@@ -140,11 +146,12 @@ public final class WebSocketConnection extends Connection
 						for (Iterator<Message> iter = messages.iterator(); iter.hasNext();)
 						{
 							Message      msg = iter.next();
-							ByteBuffer frame = msg.makeNextFrame(0x800);
+							ByteBuffer frame = msg.makeNextFrame(MAX_FRAME_SIZE);
 							
 							if (frame != null)
 							{
-								System.out.println("sent frame: " + Message.debugPrintFrame(frame));
+								// debug output
+								// System.out.println("sent frame: " + Message.debugPrintFrame(frame));
 								socket.send(frame);
 							}
 							else
@@ -169,7 +176,7 @@ public final class WebSocketConnection extends Connection
 							if (WebSocketConnection.this.isClosed.get())
 							{
 								// debug output
-								System.out.println("Worker thread shutting down");
+								// System.out.println("Worker thread shutting down");
 								return;
 							}
 						}
@@ -181,7 +188,7 @@ public final class WebSocketConnection extends Connection
 						if (WebSocketConnection.this.isClosed.get())
 						{
 							// debug output
-							System.out.println("Worker thread shutting down");
+							// System.out.println("Worker thread shutting down");
 							return;
 						}
 					}
@@ -200,11 +207,23 @@ public final class WebSocketConnection extends Connection
 		this.workerThread = null;	// dispose of the thread
 	}
 	
+	// Called when a fatal error occurs
+	void fatal()
+	{
+		System.err.println("Fatal BLIP error");
+		this.shutdown();
+	}
+	
 	
 	void onFrame(ByteBuffer frame)
 	{
+		if (frame.remaining() == 0)
+		{
+			this.fatal();
+		}
+		
 		// debug output
-		System.out.println("got frame:  " + Message.debugPrintFrame(frame));
+		// System.out.println("got frame:  " + Message.debugPrintFrame(frame));
 		
 		int number = Message.readVarint(frame);
 		int flags  = Message.readVarint(frame);
@@ -217,8 +236,8 @@ public final class WebSocketConnection extends Connection
 			msg = this.inRequests.get(number);
 			if (msg == null)
 			{
-				msg = new Message();
-				msg.readFirstFrame(frame, number, flags);
+				msg = new Message(this, number, flags, false);
+				msg.readFirstFrame(frame, flags);
 				this.inRequests.put(number, msg);
 			}
 			else
@@ -227,12 +246,12 @@ public final class WebSocketConnection extends Connection
 				if ((flags & Message.MORECOMING) == 0)
 				{
 					this.inRequests.remove(number);
-					ConnectionDelegate del = this.delegate;
+					ConnectionListener del = this.listener;
 					if (del != null)
 						del.onRequest(this, msg);
 					
 					// debug output
-					System.out.println("Message obj successfully processed (connection obj #" + System.identityHashCode(this) + ") : " + msg.toStringWithProperties());
+					// System.out.println("Message obj successfully processed (connection obj #" + System.identityHashCode(this) + ") : " + msg.toStringWithProperties());
 				}
 			}
 		}
@@ -244,7 +263,7 @@ public final class WebSocketConnection extends Connection
 				if (!msg.stateFlag)
 				{
 					msg.stateFlag = true;
-					msg.readFirstFrame(frame, number, flags);
+					msg.readFirstFrame(frame, flags);
 				}
 				else
 				{
@@ -254,25 +273,17 @@ public final class WebSocketConnection extends Connection
 						this.inReplies.remove(number);
 						
 						{
-							MessageDelegate del = msg.delegate;
+							ReplyListener del = msg.listener;
 							if (del != null) del.onCompleted(msg);
 						}
 						
 						{
-							ConnectionDelegate del = this.delegate;
+							ConnectionListener del = this.listener;
 							if (del != null) del.onResponse(this, msg);
 						}
 					}
 				}
 			}
-		}
-		else if (type == Message.ACKMSG)
-		{
-			
-		}
-		else if (type == Message.ACKRPY)
-		{
-			
 		}
 		else
 		{
@@ -285,7 +296,7 @@ public final class WebSocketConnection extends Connection
 	private void enqueueMessage(Message msg)
 	{
 		// debug output
-		System.out.println("Sending message obj: " + msg.toStringWithProperties());
+		// System.out.println("Sending message obj: " + msg.toStringWithProperties());
 		
 		msg.isMutable = false;
 		boolean flag = this.outMessages.isEmpty();
@@ -299,27 +310,27 @@ public final class WebSocketConnection extends Connection
 		}
 	}
 	
-	/**
+	/** 
 	 * Sends a request message through this connection
 	 * @param request the request message to send
 	 * @return the reply message, or null if the request's noreply flag is set
 	 */
 	@Override
-	public Message sendRequest(Message request)
+	protected Message sendMessage(Message msg)
 	{
-		if (!request.isMine) throw new UnsupportedOperationException("Cannot send a message that is not mine");
+		if (!msg.isMine)            throw new UnsupportedOperationException("Cannot send a message that is not mine");
+		if (msg.connection != this) throw new UnsupportedOperationException("Connection does not own message");
 		
 		// This will be the reply to this message when all frames are received:
-		Message msg = null;		
-		if (!request.isNoReply())
+		Message reply = null;
+		if (msg.isRequest() && !msg.isNoReply())
 		{
-			msg = new Message();
-			int number = request.number;
-			msg.number = number; 
-			this.inReplies.put(number, msg);
+			int number = msg.number;
+			reply = new Message(this, msg.number, Message.RPY, false);
+			this.inReplies.put(number, reply);
 		}
-		this.enqueueMessage(request);
-		return msg;
+		this.enqueueMessage(msg);
+		return reply;
 	}
 	
 	
@@ -333,8 +344,6 @@ public final class WebSocketConnection extends Connection
 	}
 	
 	
-	// FIXME fix NullPointerExceptions:
-	
 	@Override
 	public boolean equals(Object that)
 	{
@@ -343,13 +352,17 @@ public final class WebSocketConnection extends Connection
 	
 	public boolean equals(WebSocketConnection that)
 	{
-		return this.socket.getRemoteSocketAddress().equals(that.socket.getRemoteSocketAddress());
+		return this.uri.equals(that.uri);
 	}
 	
+	/**
+	 * Returns a hash code representation of this connection
+	 * @return the hash code
+	 */
 	@Override
 	public int hashCode()
 	{
-		return this.socket.getRemoteSocketAddress().hashCode();
+		return this.uri.hashCode();
 	}
 	
 	/**
@@ -359,6 +372,6 @@ public final class WebSocketConnection extends Connection
 	@Override
 	public String toString()
 	{
-		return "BLIP connection (socket " + this.socket.getRemoteSocketAddress() + ')';
+		return "BLIP connection (" + this.uri + ')';
 	}
 }
